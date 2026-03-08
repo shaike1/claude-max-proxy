@@ -7,17 +7,61 @@ import { v4 as uuidv4 } from "uuid";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import { cliResultToOpenai, createDoneChunk, } from "../adapter/cli-to-openai.js";
+
+const FALLBACK_URL = process.env.CLAUDE_PROXY_FALLBACK_URL || null;
+
+async function forwardToFallback(body, res, stream, requestId) {
+    if (!FALLBACK_URL) return false;
+    try {
+        console.log(`[Fallback] Forwarding to ${FALLBACK_URL}`);
+        const fetch = (await import("node:http")).request;
+        const url = new URL("/v1/chat/completions", FALLBACK_URL);
+        const payload = JSON.stringify(body);
+        const options = {
+            hostname: url.hostname,
+            port: url.port || 80,
+            path: url.pathname,
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(payload),
+            },
+        };
+        return new Promise((resolve) => {
+            const req = fetch(options, (fbRes) => {
+                if (stream) {
+                    res.setHeader("Content-Type", "text/event-stream");
+                    res.setHeader("Cache-Control", "no-cache");
+                    res.setHeader("Connection", "keep-alive");
+                    res.setHeader("X-Request-Id", requestId);
+                    res.setHeader("X-Served-By", "fallback");
+                    fbRes.pipe(res);
+                } else {
+                    res.setHeader("Content-Type", "application/json");
+                    res.setHeader("X-Served-By", "fallback");
+                    fbRes.pipe(res);
+                }
+                fbRes.on("end", () => resolve(true));
+                fbRes.on("error", () => resolve(false));
+            });
+            req.on("error", () => resolve(false));
+            req.write(payload);
+            req.end();
+        });
+    } catch (err) {
+        console.error("[Fallback] Error:", err.message);
+        return false;
+    }
+}
+
 /**
  * Handle POST /v1/chat/completions
- *
- * Main endpoint for chat requests, supports both streaming and non-streaming
  */
 export async function handleChatCompletions(req, res) {
     const requestId = uuidv4().replace(/-/g, "").slice(0, 24);
     const body = req.body;
     const stream = body.stream === true;
     try {
-        // Validate request
         if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
             res.status(400).json({
                 error: {
@@ -28,90 +72,78 @@ export async function handleChatCompletions(req, res) {
             });
             return;
         }
-        // Convert to CLI input format
         const cliInput = openaiToCli(body);
         const subprocess = new ClaudeSubprocess();
         if (stream) {
-            await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
+            await handleStreamingResponse(req, res, subprocess, cliInput, requestId, body);
+        } else {
+            await handleNonStreamingResponse(res, subprocess, cliInput, requestId, body);
         }
-        else {
-            await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
-        }
-    }
-    catch (error) {
+    } catch (error) {
         const message = error instanceof Error ? error.message : "Unknown error";
         console.error("[handleChatCompletions] Error:", message);
         if (!res.headersSent) {
-            res.status(500).json({
-                error: {
-                    message,
-                    type: "server_error",
-                    code: null,
-                },
-            });
+            const forwarded = await forwardToFallback(body, res, stream, requestId);
+            if (!forwarded) {
+                res.status(500).json({
+                    error: { message, type: "server_error", code: null },
+                });
+            }
         }
     }
 }
+
 /**
- * Handle streaming response (SSE)
- *
- * IMPORTANT: The Express req.on("close") event fires when the request body
- * is fully received, NOT when the client disconnects. For SSE connections,
- * we use res.on("close") to detect actual client disconnection.
+ * Handle streaming response (SSE) with lazy header flush for fallback support
  */
-async function handleStreamingResponse(req, res, subprocess, cliInput, requestId) {
-    // Set SSE headers
-    res.setHeader("Content-Type", "text/event-stream");
-    res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
-    res.setHeader("X-Request-Id", requestId);
-    // CRITICAL: Flush headers immediately to establish SSE connection
-    // Without this, headers are buffered and client times out waiting
-    res.flushHeaders();
-    // Send initial comment to confirm connection is alive
-    res.write(":ok\n\n");
+async function handleStreamingResponse(req, res, subprocess, cliInput, requestId, originalBody) {
     return new Promise((resolve, reject) => {
+        let headersFlushed = false;
         let isFirst = true;
         let lastModel = "claude-sonnet-4";
         let isComplete = false;
-        // Handle actual client disconnect (response stream closed)
-        res.on("close", () => {
-            if (!isComplete) {
-                // Client disconnected before response completed - kill subprocess
-                subprocess.kill();
+        let hasContent = false;
+
+        function flushHeaders() {
+            if (!headersFlushed) {
+                headersFlushed = true;
+                res.setHeader("Content-Type", "text/event-stream");
+                res.setHeader("Cache-Control", "no-cache");
+                res.setHeader("Connection", "keep-alive");
+                res.setHeader("X-Request-Id", requestId);
+                res.flushHeaders();
+                res.write(":ok\n\n");
             }
+        }
+
+        res.on("close", () => {
+            if (!isComplete) subprocess.kill();
             resolve();
         });
-        // Handle streaming content deltas
+
         subprocess.on("content_delta", (event) => {
             const text = event.event.delta?.text || "";
             if (text && !res.writableEnded) {
+                flushHeaders();
+                hasContent = true;
                 const chunk = {
                     id: `chatcmpl-${requestId}`,
                     object: "chat.completion.chunk",
                     created: Math.floor(Date.now() / 1000),
                     model: lastModel,
-                    choices: [{
-                            index: 0,
-                            delta: {
-                                role: isFirst ? "assistant" : undefined,
-                                content: text,
-                            },
-                            finish_reason: null,
-                        }],
+                    choices: [{ index: 0, delta: { role: isFirst ? "assistant" : undefined, content: text }, finish_reason: null }],
                 };
                 res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                 isFirst = false;
             }
         });
-        // Handle final assistant message (for model name)
-        subprocess.on("assistant", (message) => {
-            lastModel = message.message.model;
-        });
+
+        subprocess.on("assistant", (message) => { lastModel = message.message.model; });
+
         subprocess.on("result", (_result) => {
             isComplete = true;
+            flushHeaders();
             if (!res.writableEnded) {
-                // Send final done chunk with finish_reason
                 const doneChunk = createDoneChunk(requestId, lastModel);
                 res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
                 res.write("data: [DONE]\n\n");
@@ -119,133 +151,117 @@ async function handleStreamingResponse(req, res, subprocess, cliInput, requestId
             }
             resolve();
         });
-        subprocess.on("error", (error) => {
+
+        subprocess.on("error", async (error) => {
             console.error("[Streaming] Error:", error.message);
-            if (!res.writableEnded) {
-                res.write(`data: ${JSON.stringify({
-                    error: { message: error.message, type: "server_error", code: null },
-                })}\n\n`);
-                res.end();
-            }
-            resolve();
-        });
-        subprocess.on("close", (code) => {
-            // Subprocess exited - ensure response is closed
-            if (!res.writableEnded) {
-                if (code !== 0 && !isComplete) {
-                    // Abnormal exit without result - send error
-                    res.write(`data: ${JSON.stringify({
-                        error: { message: `Process exited with code ${code}`, type: "server_error", code: null },
-                    })}\n\n`);
+            if (!headersFlushed && !hasContent) {
+                // No content yet — try fallback before sending anything
+                const forwarded = await forwardToFallback(originalBody, res, true, requestId);
+                if (!forwarded && !res.headersSent) {
+                    res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
                 }
-                res.write("data: [DONE]\n\n");
+            } else if (!res.writableEnded) {
+                res.write(`data: ${JSON.stringify({ error: { message: error.message, type: "server_error", code: null } })}\n\n`);
                 res.end();
             }
             resolve();
         });
-        // Start the subprocess
-        subprocess.start(cliInput.prompt, {
-            model: cliInput.model,
-            sessionId: cliInput.sessionId,
-        }).catch((err) => {
-            console.error("[Streaming] Subprocess start error:", err);
-            reject(err);
+
+        subprocess.on("close", async (code) => {
+            if (!res.writableEnded) {
+                if (code !== 0 && !isComplete && !hasContent && !headersFlushed) {
+                    const forwarded = await forwardToFallback(originalBody, res, true, requestId);
+                    if (!forwarded) {
+                        flushHeaders();
+                        res.write(`data: ${JSON.stringify({ error: { message: `Process exited with code ${code}`, type: "server_error", code: null } })}\n\n`);
+                        res.write("data: [DONE]\n\n");
+                        res.end();
+                    }
+                } else {
+                    flushHeaders();
+                    if (code !== 0 && !isComplete) {
+                        res.write(`data: ${JSON.stringify({ error: { message: `Process exited with code ${code}`, type: "server_error", code: null } })}\n\n`);
+                    }
+                    res.write("data: [DONE]\n\n");
+                    res.end();
+                }
+            }
+            resolve();
         });
+
+        subprocess.start(cliInput.prompt, { model: cliInput.model, sessionId: cliInput.sessionId })
+            .catch((err) => {
+                console.error("[Streaming] Subprocess start error:", err);
+                reject(err);
+            });
     });
 }
+
 /**
- * Handle non-streaming response
+ * Handle non-streaming response with fallback
  */
-async function handleNonStreamingResponse(res, subprocess, cliInput, requestId) {
+async function handleNonStreamingResponse(res, subprocess, cliInput, requestId, originalBody) {
     return new Promise((resolve) => {
         let finalResult = null;
-        subprocess.on("result", (result) => {
-            finalResult = result;
-        });
-        subprocess.on("error", (error) => {
+
+        subprocess.on("result", (result) => { finalResult = result; });
+
+        subprocess.on("error", async (error) => {
             console.error("[NonStreaming] Error:", error.message);
-            res.status(500).json({
-                error: {
-                    message: error.message,
-                    type: "server_error",
-                    code: null,
-                },
-            });
+            const forwarded = await forwardToFallback(originalBody, res, false, requestId);
+            if (!forwarded && !res.headersSent) {
+                res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
+            }
             resolve();
         });
-        subprocess.on("close", (code) => {
+
+        subprocess.on("close", async (code) => {
             if (finalResult) {
                 res.json(cliResultToOpenai(finalResult, requestId));
-            }
-            else if (!res.headersSent) {
-                res.status(500).json({
-                    error: {
-                        message: `Claude CLI exited with code ${code} without response`,
-                        type: "server_error",
-                        code: null,
-                    },
-                });
+            } else if (!res.headersSent) {
+                const forwarded = await forwardToFallback(originalBody, res, false, requestId);
+                if (!forwarded) {
+                    res.status(500).json({
+                        error: {
+                            message: `Claude CLI exited with code ${code} without response`,
+                            type: "server_error",
+                            code: null,
+                        },
+                    });
+                }
             }
             resolve();
         });
-        // Start the subprocess
-        subprocess
-            .start(cliInput.prompt, {
-            model: cliInput.model,
-            sessionId: cliInput.sessionId,
-        })
-            .catch((error) => {
-            res.status(500).json({
-                error: {
-                    message: error.message,
-                    type: "server_error",
-                    code: null,
-                },
+
+        subprocess.start(cliInput.prompt, { model: cliInput.model, sessionId: cliInput.sessionId })
+            .catch(async (error) => {
+                const forwarded = await forwardToFallback(originalBody, res, false, requestId);
+                if (!forwarded && !res.headersSent) {
+                    res.status(500).json({ error: { message: error.message, type: "server_error", code: null } });
+                }
+                resolve();
             });
-            resolve();
-        });
     });
 }
+
 /**
  * Handle GET /v1/models
- *
- * Returns available models
  */
 export function handleModels(_req, res) {
     res.json({
         object: "list",
         data: [
-            {
-                id: "claude-opus-4",
-                object: "model",
-                owned_by: "anthropic",
-                created: Math.floor(Date.now() / 1000),
-            },
-            {
-                id: "claude-sonnet-4",
-                object: "model",
-                owned_by: "anthropic",
-                created: Math.floor(Date.now() / 1000),
-            },
-            {
-                id: "claude-haiku-4",
-                object: "model",
-                owned_by: "anthropic",
-                created: Math.floor(Date.now() / 1000),
-            },
+            { id: "claude-opus-4", object: "model", owned_by: "anthropic", created: Math.floor(Date.now() / 1000) },
+            { id: "claude-sonnet-4", object: "model", owned_by: "anthropic", created: Math.floor(Date.now() / 1000) },
+            { id: "claude-haiku-4", object: "model", owned_by: "anthropic", created: Math.floor(Date.now() / 1000) },
         ],
     });
 }
+
 /**
  * Handle GET /health
- *
- * Health check endpoint
  */
 export function handleHealth(_req, res) {
-    res.json({
-        status: "ok",
-        provider: "claude-code-cli",
-        timestamp: new Date().toISOString(),
-    });
+    res.json({ status: "ok", provider: "claude-code-cli", timestamp: new Date().toISOString() });
 }
 //# sourceMappingURL=routes.js.map
